@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREFIX="cm"
-
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
 DIM=$'\033[2m'
@@ -12,6 +10,7 @@ RESET=$'\033[0m'
 ARCHIVE_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/claudemacs/archived"
 PROJECTS_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/claudemacs/projects"
 REMOTE_HOSTS_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/claudemacs/remote-hosts"
+PROJECT_PATHS_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/claudemacs/project-paths"
 
 # Prefix for remote SSH commands — non-interactive SSH doesn't load the login
 # shell profile, so tmux/claude may not be on PATH.
@@ -43,35 +42,42 @@ _unarchive() {
 # --- Queries ---
 
 _sessions() {
-    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${PREFIX}/" | while IFS= read -r s; do
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r s; do
         tmux show-environment -t "=$s" CLAUDEMACS_PROXY 2>/dev/null | grep -q '=' || echo "$s"
     done || true
 }
 
 _projects() {
-    # Merge persisted projects with live tmux sessions
+    # Merge live tmux sessions, persisted projects, and discovered git repos
     local seen=()
+    local seen_list=""
     # First, live sessions (they have current path)
     local sessions
     sessions=$(_sessions)
     if [ -n "$sessions" ]; then
         while IFS= read -r s; do
-            local name="${s#${PREFIX}/}"
             local path
             path=$(tmux display-message -t "$s" -p '#{session_path}')
-            printf '%s\t%s\n' "$name" "$path"
-            seen+=("$name")
+            printf '%s\t%s\n' "$s" "$path"
+            seen+=("$s")
+            seen_list="${seen_list}${s}"$'\n'
         done <<< "$sessions"
     fi
     # Then, persisted projects not currently live
-    [ -f "$PROJECTS_FILE" ] || return 0
-    while IFS=$'\t' read -r name path; do
-        local found=0
-        for s in "${seen[@]:-}"; do
-            [ "$s" = "$name" ] && { found=1; break; }
-        done
-        [ "$found" -eq 0 ] && printf '%s\t%s\n' "$name" "$path"
-    done < "$PROJECTS_FILE"
+    if [ -f "$PROJECTS_FILE" ]; then
+        while IFS=$'\t' read -r name path; do
+            local found=0
+            for s in "${seen[@]:-}"; do
+                [ "$s" = "$name" ] && { found=1; break; }
+            done
+            if [ "$found" -eq 0 ]; then
+                printf '%s\t%s\n' "$name" "$path"
+                seen_list="${seen_list}${name}"$'\n'
+            fi
+        done < "$PROJECTS_FILE"
+    fi
+    # Finally, discovered projects from configured scan directories
+    _discover_projects "$seen_list"
 }
 
 _save_project() {
@@ -85,29 +91,75 @@ _save_project() {
     printf '%s\t%s\n' "$name" "$path" >> "$PROJECTS_FILE"
 }
 
+_discover_projects() {
+    local seen="$1"  # newline-separated session names to skip
+    [ -f "$PROJECT_PATHS_FILE" ] || return 0
+    while IFS= read -r dir; do
+        [[ "$dir" =~ ^#|^$ ]] && continue
+        dir="${dir/#\~/$HOME}"
+        [ -d "$dir" ] || continue
+        find "$dir" -maxdepth 3 -name .git -type d 2>/dev/null | while read -r gitdir; do
+            local path="${gitdir%/.git}"
+            local name="${path##*/}"
+            # Skip if already seen (live or persisted)
+            echo "$seen" | grep -qxF "$name" && continue
+            printf '%s\t%s\n' "$name" "$path"
+        done
+    done < "$PROJECT_PATHS_FILE"
+}
+
 _tasks() {
-    local sessions
-    sessions=$(_sessions)
-    [ -z "$sessions" ] && return 0
-    while IFS= read -r s; do
-        local proj="${s#${PREFIX}/}"
-        tmux list-windows -t "=$s" -F "#{session_name}:#{window_index}	${proj}	#{window_name}	#{pane_current_command}	#{window_activity}" 2>/dev/null
-    done <<< "$sessions" | sort -t$'\t' -k5 -rn | while IFS=$'\t' read -r target project name cmd activity; do
+    # Build proxy session set: collect session names that have CLAUDEMACS_PROXY env
+    local _proxy_list=""
+    local _s
+    while IFS= read -r _s; do
+        if tmux show-environment -t "=$_s" CLAUDEMACS_PROXY 2>/dev/null | grep -q '='; then
+            _proxy_list="${_proxy_list}|${_s}"
+        fi
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    # Single list-windows -a call, exclude proxy sessions
+    local _all_windows
+    _all_windows=$(tmux list-windows -a -F "#{session_name}:#{window_index}	#{session_name}	#{window_name}	#{pane_current_command}	#{window_activity}" 2>/dev/null) || return 0
+    [ -z "$_all_windows" ] && return 0
+
+    # Load archive set once into a newline-separated string for matching
+    local _archived_list=""
+    if [ -f "$ARCHIVE_FILE" ]; then
+        _archived_list=$(<"$ARCHIVE_FILE")
+    fi
+
+    # Exclude proxy sessions
+    local _filtered=""
+    while IFS=$'\t' read -r _target _sess _wname _cmd _activity; do
+        [[ "$_proxy_list" == *"|${_sess}"* ]] && continue
+        _filtered="${_filtered}${_target}	${_sess}	${_wname}	${_cmd}	${_activity}
+"
+    done <<< "$_all_windows"
+    [ -z "$_filtered" ] && return 0
+
+    while IFS=$'\t' read -r target project name cmd activity; do
+        [ -z "$target" ] && continue
         local status icon color sort_order
-        if echo "$cmd" | grep -qE '^(bash|zsh|fish|sh|dash)$'; then
+        if [[ "$cmd" =~ ^(bash|zsh|fish|sh|dash)$ ]]; then
             status="idle" icon="○" color="$YELLOW" sort_order=1
         else
-            local tail
-            tail=$(tmux capture-pane -t "$target" -p -S -10 2>/dev/null)
-            local lastline
-            lastline=$(echo "$tail" | sed '/^$/d' | tail -1)
-            if echo "$tail" | grep -qE '⏺|❯'; then
+            # Single capture-pane call; derive tail from it
+            local full_capture
+            full_capture=$(tmux capture-pane -t "$target" -p -S -50 2>/dev/null)
+            # Extract last non-empty line and last 10 non-empty lines for status detection
+            local tail lastline
+            tail=""
+            lastline=""
+            tail=$(printf '%s\n' "$full_capture" | tail -20 | sed '/^$/d' | tail -10)
+            lastline=$(printf '%s\n' "$tail" | tail -1)
+            if [[ "$tail" =~ ⏺|❯ ]]; then
                 # claude code session (may have subprocesses running)
-                if echo "$lastline" | grep -qE 'esc to interrupt|ctrl\+c to interrupt'; then
+                if [[ "$lastline" =~ esc\ to\ interrupt|ctrl\+c\ to\ interrupt ]]; then
                     status="running" icon="●" color="$GREEN" sort_order=2
-                elif echo "$lastline" | grep -qE '\[[Yy]/[Nn]\]|Enter to select .* Esc to cancel|Esc to cancel|ctrl-g to edit in VS Code|\(esc\)$'; then
+                elif [[ "$lastline" =~ \[[Yy]/[Nn]\]|Enter\ to\ select.*Esc\ to\ cancel|Esc\ to\ cancel|ctrl-g\ to\ edit\ in\ VS\ Code|\(esc\)$ ]]; then
                     status="waiting" icon="◎" color="$YELLOW" sort_order=0
-                elif echo "$tail" | grep -qE '❯ [0-9]+\.|Ready to submit'; then
+                elif [[ "$tail" =~ ❯\ [0-9]+\.|Ready\ to\ submit ]]; then
                     # Claude numbered menu selection
                     status="waiting" icon="◎" color="$YELLOW" sort_order=0
                 else
@@ -118,11 +170,16 @@ _tasks() {
                 status="process" icon="⚙" color="$DIM" sort_order=3
             fi
         fi
-        if _is_archived "$target"; then
+        # Check archive via string match (avoids per-task grep)
+        if [ -n "$_archived_list" ] && [[ $'\n'"$_archived_list"$'\n' == *$'\n'"$target"$'\n'* ]]; then
             status="archived" icon="▪" color="$DIM" sort_order=4
         fi
         local pane_text
-        pane_text=$(tmux capture-pane -t "$target" -p -S -50 2>/dev/null | tr '\n' ' ' | tr '\t' ' ')
+        if [[ "$cmd" =~ ^(bash|zsh|fish|sh|dash)$ ]]; then
+            pane_text=$(tmux capture-pane -t "$target" -p -S -50 2>/dev/null | tr '\n' ' ' | tr '\t' ' ')
+        else
+            pane_text=$(printf '%s' "$full_capture" | tr '\n' ' ' | tr '\t' ' ')
+        fi
         local proj_col=15 name_col=20
         # Truncate long names
         [ ${#project} -gt $proj_col ] && project="${project:0:$((proj_col-1))}…"
@@ -138,7 +195,7 @@ _tasks() {
         pad=$(printf '%*s' "$pad_len" '')
         printf '%s\t%s%s%s%s%s%s%s\t%s\t%s\n' \
             "$target" "$DIM" "$label" "$RESET" "$pad" "$color" "$status_str" "$RESET" "$pane_text" "$sort_order"
-    done
+    done < <(printf '%s' "$_filtered" | sort -t$'\t' -k5 -rn)
 }
 
 _remote_peers() {
@@ -146,13 +203,38 @@ _remote_peers() {
     local json
     json=$(tailscale status --json 2>/dev/null) || return 0
 
-    # Read whitelist if it exists
+    # Build whitelist filter for jq/python
+    # Only use whitelist if file exists and has non-comment, non-blank lines
     local whitelist_arg=""
-    if [ -f "$REMOTE_HOSTS_FILE" ]; then
+    if [ -f "$REMOTE_HOSTS_FILE" ] && grep -qv '^#\|^$' "$REMOTE_HOSTS_FILE"; then
         whitelist_arg="$REMOTE_HOSTS_FILE"
     fi
 
-    printf '%s' "$json" | python3 -c '
+    if command -v jq >/dev/null 2>&1; then
+        # Build jq whitelist filter
+        local jq_filter
+        if [ -n "$whitelist_arg" ]; then
+            # Read whitelist into a jq array, filtering comments and blanks
+            local wl_json
+            wl_json=$(grep -v '^#' "$whitelist_arg" | grep -v '^$' | jq -R . | jq -s .)
+            jq_filter='(.Peer // {}) | to_entries[].value
+                | select(.Online == true)
+                | select(.OS != null and .OS != "" and .OS != "iOS" and .OS != "android")
+                | select(.TailscaleIPs | length > 0)
+                | ((.HostName // (.DNSName // "unknown")) | split(".")[0]) as $host
+                | select('"$wl_json"' | index($host))
+                | "\(.TailscaleIPs[0])\t\($host)"'
+        else
+            jq_filter='(.Peer // {}) | to_entries[].value
+                | select(.Online == true)
+                | select(.OS != null and .OS != "" and .OS != "iOS" and .OS != "android")
+                | select(.TailscaleIPs | length > 0)
+                | "\(.TailscaleIPs[0])\t\((.HostName // (.DNSName // "unknown")) | split(".")[0])"'
+        fi
+        printf '%s' "$json" | jq -r "$jq_filter" 2>/dev/null || true
+    else
+        # Fallback to python3
+        printf '%s' "$json" | python3 -c '
 import sys, json, os
 
 whitelist_file = sys.argv[1] if len(sys.argv) > 1 else None
@@ -167,19 +249,19 @@ for key, peer in peers.items():
     if not peer.get("Online", False):
         continue
     os_name = peer.get("OS", "")
-    if os_name in ("iOS", "android"):
+    if not os_name or os_name in ("iOS", "android"):
         continue
     ips = peer.get("TailscaleIPs", [])
     if not ips:
         continue
     hostname = peer.get("HostName", peer.get("DNSName", "unknown")).split(".")[0]
 
-    # Filter by whitelist if present
     if whitelist and hostname not in whitelist:
         continue
 
     print(f"{ips[0]}\t{hostname}")
 ' "$whitelist_arg" 2>/dev/null || true
+    fi
 }
 
 _host_picker() {
@@ -199,11 +281,10 @@ _remote_projects_for_host() {
     local ip="$1" hostname="$2"
     local raw
     raw=$(ssh -o ConnectTimeout=2 -o BatchMode=yes "$ip" \
-        "${_RENV} for s in \$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^${PREFIX}/'); do printf '%s\\t%s\\n' \"\$s\" \"\$(tmux display-message -t \"=\$s\" -p '#{session_path}')\"; done" 2>/dev/null) || return 0
+        "${_RENV} for s in \$(tmux list-sessions -F '#{session_name}' 2>/dev/null); do printf '%s\\t%s\\n' \"\$s\" \"\$(tmux display-message -t \"=\$s\" -p '#{session_path}')\"; done" 2>/dev/null) || return 0
     [ -z "$raw" ] && return 0
     while IFS=$'\t' read -r session_name session_path; do
-        local proj="${session_name#${PREFIX}/}"
-        printf 'remote:%s:%s\t%s\t%s\n' "$ip" "$hostname" "$proj" "$session_path"
+        printf 'remote:%s:%s\t%s\t%s\n' "$ip" "$hostname" "$session_name" "$session_path"
     done <<< "$raw"
 }
 
@@ -237,8 +318,8 @@ _remote_tasks_for_host() {
     local raw
     raw=$(ssh -o ConnectTimeout=2 -o BatchMode=yes "$ip" \
         "${_RENV}"'
-for s in $(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^'"${PREFIX}"'/"); do
-    tmux list-windows -t "=$s" -F "#{session_name}:#{window_index}@@${s#'"${PREFIX}"'/}@@#{window_name}@@#{pane_current_command}@@#{window_activity}" 2>/dev/null | while IFS= read -r line; do
+for s in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+    tmux list-windows -t "=$s" -F "#{session_name}:#{window_index}@@${s}@@#{window_name}@@#{pane_current_command}@@#{window_activity}" 2>/dev/null | while IFS= read -r line; do
         target="${line%%@@*}"
         cmd=$(printf "%s" "$line" | awk -F "@@" "{print \$4}")
         if printf "%s" "$cmd" | grep -qE "^(bash|zsh|fish|sh|dash)$"; then
@@ -532,22 +613,20 @@ _create_project() {
     name=$(echo "$name" | tr -cd 'a-zA-Z0-9._-')
     [ -z "$name" ] && die "invalid project name"
     [ -d "$path" ] || die "not a directory: $path"
-    local session="${PREFIX}/${name}"
-    tmux has-session -t "=$session" 2>/dev/null && die "project already exists: $name"
-    tmux new-session -d -s "$session" -c "$path" -n "shell"
+    tmux has-session -t "=$name" 2>/dev/null && die "project already exists: $name"
+    tmux new-session -d -s "$name" -c "$path" -n "shell"
     _save_project "$name" "$path"
 }
 
 _create_task() {
-    local project="$1" name="$2" cmd="${3:-claude}"
-    local session="${PREFIX}/${project}"
+    local session="$1" name="$2" cmd="${3:-claude}"
     local proj_path
     # Recreate session from persisted project if needed
     if ! tmux has-session -t "=$session" 2>/dev/null; then
         if [ -f "$PROJECTS_FILE" ]; then
-            proj_path=$(grep "^${project}"$'\t' "$PROJECTS_FILE" | cut -f2)
+            proj_path=$(grep "^${session}"$'\t' "$PROJECTS_FILE" | cut -f2)
         fi
-        [ -z "$proj_path" ] && die "no such project: $project"
+        [ -z "$proj_path" ] && die "no such session: $session"
         [ -d "$proj_path" ] || die "project directory gone: $proj_path"
         tmux new-session -d -s "$session" -c "$proj_path" -n "$name"
         local target="${session}:0"
@@ -567,15 +646,13 @@ _create_project_remote() {
     local ip="$1" name="$2" path="$3"
     name=$(echo "$name" | tr -cd 'a-zA-Z0-9._-')
     [ -z "$name" ] && die "invalid project name"
-    local session="${PREFIX}/${name}"
     ssh -o ConnectTimeout=5 -o BatchMode=yes "$ip" \
-        "${_RENV} tmux new-session -d -s '${session}' -c '${path}' -n 'shell' && tmux set-option -t '=${session}' prefix C-a" \
+        "${_RENV} tmux new-session -d -s '${name}' -c '${path}' -n 'shell' && tmux set-option -t '=${name}' prefix C-a" \
         || die "failed to create remote project on $ip"
 }
 
 _create_task_remote() {
-    local ip="$1" project="$2" task_name="$3" cmd="${4:-claude}"
-    local session="${PREFIX}/${project}"
+    local ip="$1" session="$2" task_name="$3" cmd="${4:-claude}"
     local idx
     local send_keys_cmd=""
     [ -n "$cmd" ] && send_keys_cmd="&& tmux send-keys -t '\${session}:'\"\$idx\" '${cmd}' Enter"
@@ -604,6 +681,41 @@ _path_picker_remote() {
     fzf --layout=reverse --scheme=path \
         --prompt 'Remote path: ' \
         --print-query | tail -1
+}
+
+# --- Project Path Management ---
+
+_add_path() {
+    local dir="${1:-}"
+    [ -z "$dir" ] && die "usage: claudemacs add-path <directory>"
+    dir="${dir/#\~/$HOME}"
+    [ -d "$dir" ] || die "not a directory: $dir"
+    # Resolve to absolute path
+    dir=$(cd "$dir" && pwd)
+    mkdir -p "$(dirname "$PROJECT_PATHS_FILE")"
+    # Dedup: skip if already present (ignoring comments/blanks)
+    if [ -f "$PROJECT_PATHS_FILE" ]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^#|^$ ]] && continue
+            local expanded="${line/#\~/$HOME}"
+            [ -d "$expanded" ] && expanded=$(cd "$expanded" && pwd)
+            [ "$expanded" = "$dir" ] && { echo "already configured: $dir"; return 0; }
+        done < "$PROJECT_PATHS_FILE"
+    fi
+    echo "$dir" >> "$PROJECT_PATHS_FILE"
+    echo "added: $dir"
+}
+
+_list_paths() {
+    [ -f "$PROJECT_PATHS_FILE" ] || { echo "no project paths configured"; return 0; }
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#|^$ ]] && continue
+        echo "$line"
+    done < "$PROJECT_PATHS_FILE"
+}
+
+_scan_projects() {
+    _discover_projects ""
 }
 
 # --- Interactive Flows ---
@@ -650,8 +762,7 @@ _new_task_flow_first() {
     [ -z "$task_name" ] && return
     local cmd
     cmd=$(_pick_command)
-    local session="${PREFIX}/${project}"
-    local target="${session}:0"
+    local target="${project}:0"
     tmux rename-window -t "$target" "$task_name"
     [ -n "$cmd" ] && tmux send-keys -t "$target" "$cmd" Enter
     _switch "$target"
@@ -664,13 +775,12 @@ _new_task_flow_first_remote() {
     [ -z "$task_name" ] && return
     local cmd
     cmd=$(_pick_command)
-    local session="${PREFIX}/${project}"
     local send_keys_cmd=""
-    [ -n "$cmd" ] && send_keys_cmd="&& tmux send-keys -t '${session}:0' '${cmd}' Enter"
+    [ -n "$cmd" ] && send_keys_cmd="&& tmux send-keys -t '${project}:0' '${cmd}' Enter"
     ssh -o ConnectTimeout=5 -o BatchMode=yes "$ip" \
-        "${_RENV} tmux rename-window -t '${session}:0' '${task_name}' ${send_keys_cmd}" \
+        "${_RENV} tmux rename-window -t '${project}:0' '${task_name}' ${send_keys_cmd}" \
         || die "failed to set up first task on $ip"
-    local target="remote:${ip}:${session}:0"
+    local target="remote:${ip}:${project}:0"
     _switch "$target" "$task_name"
 }
 
@@ -689,7 +799,7 @@ _new_task_flow() {
     projects=$(_all_projects)
 
     if [ -z "$projects" ]; then
-        echo "No projects yet. Create one first."
+        echo "No sessions yet. Create a project first."
         echo ""
         _new_project_flow || return
         echo ""
@@ -697,9 +807,9 @@ _new_task_flow() {
     fi
 
     local selected
-    printf '%sSelect project%s\n' "$BOLD" "$RESET"
-    # Format: origin\tproject\tpath
-    # Display project name with dimmed [hostname] for remote entries
+    printf '%sSelect session%s\n' "$BOLD" "$RESET"
+    # Format: origin\tsession_name\tpath
+    # Display name with dimmed [hostname] for remote entries
     local new_entry
     new_entry=$(printf 'new\t\t\t%s+ New project%s' "$GREEN" "$RESET")
     selected=$({ echo "$new_entry"; echo "$projects" | awk -F'\t' '{
@@ -760,6 +870,12 @@ _new_task_flow() {
     cmd=$(_pick_command)
 
     if [ "$origin" = "local" ]; then
+        # Auto-persist discovered projects on first use
+        if [ ! -f "$PROJECTS_FILE" ] || ! grep -q "^${proj_name}"$'\t' "$PROJECTS_FILE"; then
+            local proj_path
+            proj_path=$(echo "$selected" | cut -f3)
+            [ -n "$proj_path" ] && _save_project "$proj_name" "$proj_path"
+        fi
         local target
         target=$(_create_task "$proj_name" "$task_name" "$cmd")
         _switch "$target"
@@ -804,7 +920,7 @@ _picker() {
 
     if [ ! -s "$local_cache" ]; then
         kill "$fetch_pid" 2>/dev/null; wait "$fetch_pid" 2>/dev/null || true
-        echo "No claudemacs sessions."
+        echo "No tmux sessions."
         echo ""
         _new_project_flow || return
         _new_task_flow
@@ -864,6 +980,9 @@ Usage:
   claudemacs new          Create a new task
   claudemacs new-project  Create a new project
   claudemacs projects     List projects
+  claudemacs add-path <dir>  Add a directory to scan for git repos
+  claudemacs paths        List configured project scan directories
+  claudemacs scan         Show all discovered git repo projects
   claudemacs setup        Print tmux.conf setup instructions
 
 Keybindings (in picker):
@@ -882,6 +1001,9 @@ main() {
         -h|--help|help) _usage ;;
         setup)          _setup ;;
         projects)       _require_tmux; _projects ;;
+        add-path)       shift; _add_path "$@" ;;
+        paths)          _list_paths ;;
+        scan)           _scan_projects ;;
         new)            _require_tmux; _require_fzf; shift; _new_task_flow "$*" ;;
         new-project)    _require_tmux; _require_fzf; _new_project_flow ;;
         _tasks)         _require_tmux; _tasks | sort -t$'\t' -k4 -n -s | cut -f1-3 ;;
